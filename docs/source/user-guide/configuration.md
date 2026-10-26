@@ -180,6 +180,47 @@ plan executes normally; only the split points are invisible, since
 {py:attr}`~datafusion.PhysicalPartitioning.hash_expressions` returns `None` for every scheme
 but `Hash`. Read {py:func}`repr` of the partitioning to see them.
 
+(running_plans_again)=
+
+### Running a plan again
+
+Building a physical plan can take far longer than running it, for a small query
+over a deep plan. A caller that runs the same query many times can build the plan
+once with {py:meth}`~datafusion.DataFrame.execution_plan` and run it with
+{py:meth}`~datafusion.SessionContext.execute`. But running a plan changes it. A
+hash join keeps the build side it collected, so the plan run again joins against
+the rows the build side had on the first run. A plan with a `RepartitionExec`
+runs only once: running it again panics with "partition not used yet".
+
+{py:meth}`~datafusion.ExecutionPlan.reset_state` returns a copy of the plan with
+every node's execution state reset, which runs as if newly built:
+
+```python
+plan = ctx.sql("select ...").execution_plan()
+
+for _ in range(steps):
+    # ... change the data the plan's tables hold ...
+    fresh = plan.reset_state()
+    for partition in range(fresh.partition_count):
+        for batch in ctx.execute(fresh, partition):
+            ...
+```
+
+Reset the plan before each run. Making the copy copies no data, so it takes
+microseconds whatever the size of the tables.
+
+The copy does not reset dynamic filters. With dynamic filter pushdown, a join
+narrows the scan on its probe side to the key range of its build side. The copy
+keeps the filter from the first run, so when the build side's keys change, the
+copy can silently drop rows that match. Turn pushdown off for a session that runs
+plans again:
+
+```python
+config = SessionConfig().set(
+    "datafusion.optimizer.enable_dynamic_filter_pushdown", "false"
+)
+```
+
 ### Benchmark Example
 
 The repository includes a benchmark script that demonstrates how to maximize CPU usage

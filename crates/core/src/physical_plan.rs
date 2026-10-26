@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use prost::Message;
@@ -113,6 +114,12 @@ impl PyExecutionPlan {
         let plan =
             proto_plan.try_into_physical_plan(ctx.ctx.task_ctx().as_ref(), codec.as_ref())?;
         Ok(Self::new(plan))
+    }
+
+    /// A copy of this plan with every node's execution state reset, ready
+    /// to run again. This plan is left unchanged.
+    pub fn reset_state(&self) -> PyDataFusionResult<Self> {
+        Ok(Self::new(reset_plan_states(Arc::clone(&self.plan))?))
     }
 
     pub fn metrics(&self) -> Option<PyMetricsSet> {
