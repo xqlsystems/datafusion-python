@@ -17,6 +17,7 @@
 
 import datetime
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -231,6 +232,92 @@ def test_execute_rejects_a_negative_partition() -> None:
 
     with pytest.raises(OverflowError):
         ctx.execute(plan, -1)
+
+
+def _rows(ctx, plan):
+    return [
+        row
+        for partition in range(plan.partition_count)
+        for batch in ctx.execute(plan, partition)
+        for row in batch.to_pyarrow().to_pylist()
+    ]
+
+
+def test_reset_state_reads_a_hash_joins_build_side_again() -> None:
+    """A plan run again keeps its build side; a reset copy reads it again.
+
+    The table is changed by writing into the NumPy array that its record batch
+    shares memory with, so the plan, which holds the table, sees the change.
+    """
+    ctx = SessionContext(SessionConfig().with_target_partitions(1))
+    a = np.arange(4.0)
+    ctx.register_record_batches("a", [[pa.record_batch({"i": np.arange(4), "v": a})]])
+    ctx.register_record_batches(
+        "b", [[pa.record_batch({"i": np.arange(4), "w": np.full(4, 10.0)})]]
+    )
+    # The subquery puts `a` on the join's build side.
+    query = (
+        "select sum(t.v2 * b.w) as s"
+        " from (select i, 2 * v as v2 from a) t join b using (i)"
+    )
+    plan = ctx.sql(query).execution_plan()
+    assert "HashJoinExec" in plan.display_indent()
+    assert _rows(ctx, plan) == [{"s": 120.0}]
+
+    a[:] = 100.0
+    assert _rows(ctx, plan) == [{"s": 120.0}]
+    assert _rows(ctx, plan.reset_state()) == [{"s": 8000.0}]
+    assert ctx.sql(query).to_pydict() == {"s": [8000.0]}
+
+
+@pytest.mark.parametrize(
+    ("pushdown", "want"),
+    [
+        # The probe side keeps the first build side's key range, 0 to 1.
+        ("true", []),
+        ("false", [{"k": 7}, {"k": 8}]),
+    ],
+)
+def test_reset_state_keeps_dynamic_filters(pushdown, want) -> None:
+    """A reset copy keeps a dynamic filter; without pushdown it has none."""
+    ctx = SessionContext(
+        SessionConfig()
+        .with_target_partitions(1)
+        .set("datafusion.optimizer.enable_dynamic_filter_pushdown", pushdown)
+    )
+    keys = np.array([0, 1])
+    ctx.register_record_batches("small", [[pa.record_batch({"k": keys})]])
+    ctx.register_record_batches("big", [[pa.record_batch({"k": np.arange(10)})]])
+    query = "select big.k from small join big on small.k = big.k order by big.k"
+    plan = ctx.sql(query).execution_plan()
+    assert _rows(ctx, plan) == [{"k": 0}, {"k": 1}]
+
+    keys[:] = [7, 8]
+    assert _rows(ctx, plan.reset_state()) == want
+    assert ctx.sql(query).to_pydict() == {"k": [7, 8]}
+
+
+def test_reset_state_runs_a_repartitioned_plan_again() -> None:
+    """A plan that repartitions runs once; a reset copy of it runs again."""
+    ctx = SessionContext(SessionConfig().with_target_partitions(4))
+    ctx.register_record_batches("t", [[pa.record_batch({"a": [1, 2, 2, 3]})]])
+    plan = ctx.sql(
+        "select a, count(*) as n from t group by a order by a"
+    ).execution_plan()
+    assert "RepartitionExec" in plan.display_indent()
+    want = [{"a": 1, "n": 1}, {"a": 2, "n": 2}, {"a": 3, "n": 1}]
+    assert _rows(ctx, plan) == want
+
+    for _ in range(2):
+        assert _rows(ctx, plan.reset_state()) == want
+
+
+def test_reset_state_returns_the_same_plan() -> None:
+    """The copy has the same operators as the plan it was made from."""
+    ctx = SessionContext()
+    ctx.register_record_batches("t", [[pa.record_batch({"a": [1, 2, 3]})]])
+    plan = ctx.sql("select a, count(*) from t group by a").execution_plan()
+    assert plan.reset_state().display_indent() == plan.display_indent()
 
 
 def test_physical_partitioning_equality_is_structural() -> None:

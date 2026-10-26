@@ -222,6 +222,27 @@ class ExecutionPlan:
         """
         return PhysicalPartitioning(self._raw_plan.output_partitioning)
 
+    def reset_state(self) -> ExecutionPlan:
+        """Return a copy of this plan with every node's execution state reset.
+
+        A plan keeps state from running, such as a hash join's build side, so
+        running it again can return the first run's rows. The copy runs as if
+        newly planned. This plan is left unchanged.
+
+        The copy does not reset dynamic filters; see :ref:`running_plans_again`.
+
+        Examples:
+            >>> import pyarrow as pa
+            >>> from datafusion import SessionContext
+            >>> ctx = SessionContext()
+            >>> ctx.register_record_batches("t", [[pa.record_batch({"a": [1, 2]})]])
+            >>> plan = ctx.sql("select sum(a) as s from t").execution_plan()
+            >>> fresh = plan.reset_state()
+            >>> [b.to_pyarrow()["s"][0].as_py() for b in ctx.execute(fresh, 0)]
+            [3]
+        """
+        return ExecutionPlan(self._raw_plan.reset_state())
+
     @staticmethod
     def from_bytes(ctx: SessionContext, data: bytes) -> ExecutionPlan:
         """Create an ExecutionPlan from serialized protobuf bytes.
